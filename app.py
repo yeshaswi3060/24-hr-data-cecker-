@@ -27,9 +27,9 @@ load_dotenv()
 app = Flask(__name__)
 
 # ── Config ──────────────────────────────────────────────────
-API_ID = os.getenv('TELEGRAM_API_ID')
-API_HASH = os.getenv('TELEGRAM_API_HASH')
-SESSION_STRING = os.getenv('TELEGRAM_SESSION_STRING', '')
+# We load multiple accounts from the environment variables.
+# Format: TELEGRAM_API_ID_1, TELEGRAM_API_HASH_1, TELEGRAM_SESSION_STRING_1, etc.
+# Or just TELEGRAM_API_ID, etc for the first one.
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 GITHUB_REPO = os.getenv('GITHUB_REPO', '')  # e.g. "yeshaswi3060/arrange-data"
 SAVE_INTERVAL = int(os.getenv('SAVE_INTERVAL', '25'))
@@ -64,7 +64,7 @@ class GitHubStorage:
         self.repo = repo
         self.base_url = f"https://api.github.com/repos/{repo}/contents"
         self.headers = {
-            'Authorization': f'token {token}',
+            'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github.v3+json'
         }
         self._sha_cache = {}
@@ -110,7 +110,7 @@ class GitHubStorage:
                 self._sha_cache[path] = resp.json()['content']['sha']
                 return True
             else:
-                print(f"[GitHub] Write fail ({path}): {resp.status_code}")
+                print(f"[GitHub] Write fail ({path}): {resp.status_code} - {resp.text[:200]}")
                 return False
         except Exception as e:
             print(f"[GitHub] Write error ({path}): {e}")
@@ -214,11 +214,61 @@ def format_phone(phone):
 
 
 # ── Telegram Checker (Background) ───────────────────────────
+def background_save(path, content, message):
+    """Fire and forget save to GitHub so it doesn't block checking."""
+    store = get_storage()
+    if store:
+        threading.Thread(target=store.write_file, args=(path, content, message), daemon=True).start()
+
+def get_telegram_accounts():
+    """Find all configured Telegram accounts in env vars."""
+    accounts = []
+    
+    # Try the default one without prefix first
+    api_id = os.getenv('TELEGRAM_API_ID')
+    api_hash = os.getenv('TELEGRAM_API_HASH')
+    session = os.getenv('TELEGRAM_SESSION_STRING')
+    
+    if api_id and api_hash and session:
+        accounts.append({
+            'id': 1,
+            'api_id': int(api_id),
+            'api_hash': api_hash,
+            'session': session
+        })
+        
+    # Look for numbered ones _1, _2, _3, etc.
+    for i in range(1, 10):
+        # Allow either _X or just X suffix
+        str_i = str(i)
+        
+        api_id = os.getenv(f'TELEGRAM_API_ID_{str_i}') or os.getenv(f'TELEGRAM_API_ID{str_i}')
+        if not api_id and i == 1:
+            continue # Already caught by default
+            
+        api_hash = os.getenv(f'TELEGRAM_API_HASH_{str_i}') or os.getenv(f'TELEGRAM_API_HASH{str_i}')
+        session = os.getenv(f'TELEGRAM_SESSION_STRING_{str_i}') or os.getenv(f'TELEGRAM_SESSION_STRING{str_i}')
+        
+        if api_id and api_hash and session:
+            accounts.append({
+                'id': i,
+                'api_id': int(api_id),
+                'api_hash': api_hash,
+                'session': session
+            })
+            
+    return accounts
 async def run_checker(phone_numbers, job_name):
     """Main checker loop — runs in a background thread."""
     global storage
     store = get_storage()
 
+    accounts = get_telegram_accounts()
+    if not accounts:
+        status['message'] = 'ERROR: No Telegram sessions configured in environment'
+        status['running'] = False
+        return
+        
     if not store:
         status['message'] = 'ERROR: GitHub credentials not configured'
         status['running'] = False
@@ -269,14 +319,33 @@ async def run_checker(phone_numbers, job_name):
         status['completed'] = True
         return
 
-    # ─ Connect to Telegram ─
-    status['message'] = 'Connecting to Telegram...'
-    client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
+    # ─ Connect to Telegram Pool ─
+    status['message'] = f'Connecting to {len(accounts)} Telegram account(s)...'
+    clients_pool = []
+    
+    for acc in accounts:
+        client = TelegramClient(StringSession(acc['session']), acc['api_id'], acc['api_hash'])
+        try:
+            await client.start()
+            clients_pool.append({
+                'id': acc['id'],
+                'client': client,
+                'sleeping_until': 0
+            })
+            print(f"Connected to Account {acc['id']}")
+        except Exception as e:
+            print(f"Failed to connect Account {acc['id']}: {e}")
+            await client.disconnect()
+            
+    if not clients_pool:
+        status['message'] = 'ERROR: Failed to connect to any Telegram accounts'
+        status['running'] = False
+        return
 
     try:
-        await client.start()
-        status['message'] = f'Checking numbers... ({start_index}/{len(phone_numbers)})'
+        status['message'] = f'Checking numbers with {len(clients_pool)} accounts... ({start_index}/{len(phone_numbers)})'
         unsaved = 0
+        current_client_idx = 0
 
         for i in range(start_index, len(phone_numbers)):
             if stop_flag.is_set():
@@ -287,6 +356,42 @@ async def run_checker(phone_numbers, job_name):
             status['current_number'] = phone
             status['message'] = f'Checking {phone}... ({i+1}/{len(phone_numbers)})'
 
+            # ─ Select active client ─
+            active_client_info = None
+            wait_msg_sent = False
+            
+            while not active_client_info:
+                if stop_flag.is_set():
+                    break
+                    
+                now = time.time()
+                for i in range(len(clients_pool)):
+                    idx = (current_client_idx + i) % len(clients_pool)
+                    if clients_pool[idx]['sleeping_until'] <= now:
+                        active_client_info = clients_pool[idx]
+                        current_client_idx = idx
+                        break
+                        
+                if not active_client_info:
+                    # All clients are rate limited, find the one that wakes up first
+                    next_wakeup = min(c['sleeping_until'] for c in clients_pool)
+                    wait_time = int(next_wakeup - now)
+                    if wait_time > 0:
+                        status['flood_wait_seconds'] = wait_time
+                        if not wait_msg_sent:
+                            status['message'] = f'⏳ All accounts rate-limited — waiting {wait_time}s'
+                            print(f"  ⚠ All accounts sleeping for {wait_time}s")
+                            # Save before deep sleep
+                            background_save(checkpoint_path, str(i), "checkpoint before long sleep")
+                            wait_msg_sent = True
+                        await asyncio.sleep(min(wait_time, 10)) # Check periodically
+            
+            if stop_flag.is_set():
+                break
+                
+            active_client = active_client_info['client']
+            status['message'] = f'Checking {phone}... (Account {active_client_info["id"]}) ({i+1}/{len(phone_numbers)})'
+
             retry = 0
             while retry < 5:
                 if stop_flag.is_set():
@@ -296,7 +401,7 @@ async def run_checker(phone_numbers, job_name):
                         client_id=i, phone=phone,
                         first_name=f"C{i}", last_name=""
                     )
-                    result = await client(ImportContactsRequest([contact]))
+                    result = await active_client(ImportContactsRequest([contact]))
 
                     if result.users:
                         user = result.users[0]
@@ -307,8 +412,8 @@ async def run_checker(phone_numbers, job_name):
                         status['last_found'] = f"{phone} — {name}"
                         print(f"  ✓ {phone}: {name}")
 
-                        # Save results to GitHub immediately
-                        store.write_file(
+                        # Auto-save results to GitHub in BACKGROUND
+                        background_save(
                             results_path,
                             '\n'.join(found_numbers) + '\n',
                             f"found: {phone}"
@@ -316,7 +421,7 @@ async def run_checker(phone_numbers, job_name):
                         status['last_save'] = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
 
                         try:
-                            await client(DeleteContactsRequest(id=[user.id]))
+                            await active_client(DeleteContactsRequest(id=[user.id]))
                         except:
                             pass
 
@@ -328,15 +433,28 @@ async def run_checker(phone_numbers, job_name):
                     break
 
                 except FloodWaitError as e:
-                    retry += 1
                     wait = e.seconds
                     status['flood_wait_seconds'] = wait
-                    status['message'] = f'⏳ Rate limited — waiting {wait}s (retry {retry}/5)'
-                    print(f"  ⚠ Flood wait {wait}s")
-                    # Save before waiting
-                    store.write_file(checkpoint_path, str(i), "checkpoint before flood")
-                    await asyncio.sleep(wait + 1)
-                    status['flood_wait_seconds'] = 0
+                    print(f"  ⚠ Account {active_client_info['id']} Flood wait {wait}s")
+                    
+                    # Mark this client as sleeping
+                    active_client_info['sleeping_until'] = time.time() + wait + 1
+                    
+                    # If we have multiple accounts, just break this inner retry loop
+                    # and the outer loop will pick the next available account for this same number
+                    if len(clients_pool) > 1:
+                        status['message'] = f'🔄 Account {active_client_info["id"]} rate limited, switching...'
+                        print(f"  🔄 Switching to next account...")
+                        # Save progress before switching just in case
+                        background_save(checkpoint_path, str(i), f"checkpoint (switching from {active_client_info['id']})")
+                        break # Break inner loop, will retry same number with new client
+                    else:
+                        # Only one account, must wait
+                        retry += 1
+                        status['message'] = f'⏳ Rate limited — waiting {wait}s (retry {retry}/5)'
+                        background_save(checkpoint_path, str(i), "checkpoint before flood")
+                        await asyncio.sleep(wait + 1)
+                        status['flood_wait_seconds'] = 0
 
                 except Exception as e:
                     status['errors'] += 1
@@ -346,15 +464,15 @@ async def run_checker(phone_numbers, job_name):
             status['checked'] = i + 1
             unsaved += 1
 
-            # Save checkpoint periodically
+            # Save checkpoint periodically (background)
             if unsaved >= SAVE_INTERVAL:
-                store.write_file(checkpoint_path, str(i + 1), f"checkpoint {i+1}/{len(phone_numbers)}")
+                background_save(checkpoint_path, str(i + 1), f"checkpoint {i+1}/{len(phone_numbers)}")
                 status['last_save'] = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
                 unsaved = 0
 
-        # Final save
-        store.write_file(checkpoint_path, str(status['checked']), "final checkpoint")
-        store.write_file(
+        # Final save (also background)
+        background_save(checkpoint_path, str(status['checked']), "final checkpoint")
+        background_save(
             results_path,
             '\n'.join(found_numbers) + '\n',
             f"final: {len(found_numbers)} found out of {len(phone_numbers)}"
@@ -369,7 +487,11 @@ async def run_checker(phone_numbers, job_name):
         status['message'] = f'ERROR: {e}'
         print(f"Checker error: {e}")
     finally:
-        await client.disconnect()
+        for c in clients_pool:
+            try:
+                await c['client'].disconnect()
+            except:
+                pass
         status['running'] = False
 
 

@@ -25,14 +25,24 @@ async def main():
     print("=" * 55)
     print()
 
-    if not API_ID or not API_HASH:
-        print("ERROR: Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env")
+    env_api_id = os.getenv('TELEGRAM_API_ID')
+    env_api_hash = os.getenv('TELEGRAM_API_HASH')
+    
+    print(f"Press Enter to use default from .env, or type new values.")
+    api_id_input = input(f"Enter API_ID [{env_api_id}]: ").strip()
+    api_hash_input = input(f"Enter API_HASH [{env_api_hash}]: ").strip()
+    
+    api_id = api_id_input if api_id_input else env_api_id
+    api_hash = api_hash_input if api_hash_input else env_api_hash
+
+    if not api_id or not api_hash:
+        print("ERROR: API_ID and API_HASH are required.")
         return
 
-    print("You will be asked for your phone number and OTP code.")
+    print("\nYou will be asked for your phone number and OTP code.")
     print()
 
-    client = TelegramClient(StringSession(), int(API_ID), API_HASH)
+    client = TelegramClient(StringSession(), int(api_id), api_hash)
     await client.start()
 
     session_string = client.session.save()
