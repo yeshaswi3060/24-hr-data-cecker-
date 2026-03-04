@@ -624,6 +624,7 @@ h1{font-size:1.6rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a
     <div class="actions">
         <button class="btn btn-start" id="btnStart" onclick="startChecker()">▶ Start Checking</button>
         <button class="btn btn-stop" id="btnStop" onclick="stopChecker()" disabled>⏹ Stop</button>
+        <button class="btn btn-secondary" onclick="window.open('/download', '_blank')">⬇ Download Results</button>
         <button class="btn btn-secondary" onclick="location.reload()">↻ Refresh</button>
     </div>
 
@@ -728,6 +729,32 @@ refreshStatus();
 @app.route('/')
 def dashboard():
     return Response(DASHBOARD, mimetype='text/html')
+
+@app.route('/download')
+def download():
+    """Download the found numbers as a text file."""
+    if not status['found_numbers'] and not current_job:
+        return "No numbers found yet.", 404
+        
+    store = get_storage()
+    if store and current_job:
+        # Try to pull latest from GitHub if available
+        res_content = store.read_file(f"telegram_results/{current_job}_telegram.txt")
+        if res_content:
+            found = [l.strip() for l in res_content.strip().split('\n') if l.strip()]
+        else:
+            found = status['found_numbers']
+    else:
+        found = status['found_numbers']
+        
+    text = '\n'.join(found)
+    filename = f"{current_job or 'results'}_telegram.txt"
+    
+    return Response(
+        text,
+        mimetype="text/plain",
+        headers={"Content-disposition": f"attachment; filename={filename}"}
+    )
 
 
 @app.route('/health')
